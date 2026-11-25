@@ -1,176 +1,193 @@
 
-import asyncio
-import json
 import os
-import time
+import re
 import aiohttp
+import asyncio
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
-TOKEN = os.getenv("BOT_TOKEN")
-DB_FILE = "accounts.json"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+SUPABASE_API = f"{SUPABASE_URL}/rest/v1"
 
-def load_data():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    return {}
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+}
 
-def save_data():
-    with open(DB_FILE, "w") as f:
-        json.dump(accounts, f)
+async def request(session, method, url, **kwargs):
+    async with session.request(
+        method, url, headers=HEADERS if "supabase.co" in url else None,
+        **kwargs
+    ) as response:
+        data = await response.json(content_type=None)
+        if response.status >= 400:
+            raise RuntimeError(str(data))
+        return data
 
-accounts = load_data()
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "أهلاً بك في InstaReturn Monitor 📡\n\n"
-        "/add username - إضافة حساب\n"
-        "/list - الحسابات المراقبة\n"
-        "/remove username - حذف حساب"
+async def send_message(session, chat_id, message):
+    await request(
+        session,
+        "POST",
+        f"{TELEGRAM_API}/sendMessage",
+        json={"chat_id": chat_id, "text": message}
     )
 
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text(
-            "اكتب: /add username"
-        )
+async def get_offset(session):
+    rows = await request(
+        session, "GET",
+        f"{SUPABASE_API}/bot_state",
+        params={"id": "eq.1", "select": "telegram_offset"}
+    )
+    if not rows:
+        raise RuntimeError("bot_state row 1 is missing")
+    return int(rows[0]["telegram_offset"])
 
-    username = context.args[0].replace("@", "").lower()
-    key = f"{update.effective_chat.id}:{username}"
-
-    accounts[key] = {
-        "username": username,
-        "chat_id": update.effective_chat.id,
-        "started": time.time(),
-        "notified": False
-    }
-
-    save_data()
-
-    await update.message.reply_text(
-        f"تمت إضافة @{username} للمراقبة 📡\n"
-        "بدأ حساب الوقت."
+async def save_offset(session, offset):
+    await request(
+        session, "PATCH",
+        f"{SUPABASE_API}/bot_state",
+        params={"id": "eq.1"},
+        json={"telegram_offset": offset}
     )
 
-async def listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    items = [
-        item for item in accounts.values()
-        if item["chat_id"] == chat_id
-    ]
+async def handle_message(session, message):
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "").strip()
 
-    if not items:
-        return await update.message.reply_text(
-            "ماكو حسابات تحت المراقبة."
+    if not text:
+        return
+
+    parts = text.split()
+    command = parts[0].split("@")[0].lower()
+
+    if command in ("/start", "/help"):
+        await send_message(
+            session, chat_id,
+            "أهلاً بيك في InstaReturn Monitor\n\n"
+            "الأوامر المتاحة:\n"
+            "/add username - إضافة حساب\n"
+            "/list - عرض الحسابات\n"
+            "/remove username - حذف حساب\n"
+            "/help - المساعدة"
+        )
+        return
+
+    if command == "/add":
+        if len(parts) != 2:
+            await send_message(session, chat_id, "اكتب الأمر هكذا:\n/add username")
+            return
+
+        username = parts[1].lstrip("@").lower()
+
+        if not re.fullmatch(r"[a-zA-Z0-9._]{1,30}", username):
+            await send_message(session, chat_id, "اسم المستخدم غير صالح.")
+            return
+
+        existing = await request(
+            session, "GET",
+            f"{SUPABASE_API}/monitored_accounts",
+            params={
+                "username": f"eq.{username}",
+                "chat_id": f"eq.{chat_id}",
+                "select": "id"
+            }
         )
 
-    message = "الحسابات المراقبة:\n\n"
+        if existing:
+            await send_message(session, chat_id, f"الحساب @{username} مضاف مسبقاً.")
+            return
 
-    for item in items:
-        elapsed = int(time.time() - item["started"])
-        hours = elapsed // 3600
-        minutes = (elapsed % 3600) // 60
-        seconds = elapsed % 60
-
-        message += (
-            f"@{item['username']}\n"
-            f"TAT: {hours}h {minutes}m {seconds}s\n\n"
+        await request(
+            session, "POST",
+            f"{SUPABASE_API}/monitored_accounts",
+            json={"username": username, "chat_id": chat_id},
+            headers={
+                **HEADERS,
+                "Prefer": "return=minimal"
+            }
         )
 
-    await update.message.reply_text(message)
+        await send_message(
+            session, chat_id,
+            f"تمت إضافة @{username} إلى قائمة المتابعة."
+        )
+        return
 
-async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text(
-            "اكتب: /remove username"
+    if command == "/list":
+        accounts = await request(
+            session, "GET",
+            f"{SUPABASE_API}/monitored_accounts",
+            params={
+                "chat_id": f"eq.{chat_id}",
+                "select": "username,status,started_at",
+                "order": "created_at.desc"
+            }
         )
 
-    username = context.args[0].replace("@", "").lower()
-    key = f"{update.effective_chat.id}:{username}"
+        if not accounts:
+            await send_message(session, chat_id, "ما عندك حسابات مضافة حالياً.")
+            return
 
-    if key in accounts:
-        del accounts[key]
-        save_data()
-        await update.message.reply_text("تم حذف الحساب.")
-    else:
-        await update.message.reply_text("الحساب غير موجود.")
+        lines = ["الحسابات المضافة:"]
+        for account in accounts:
+            lines.append(
+                f"@{account['username']} — {account['status']}"
+            )
 
-async def monitor(app):
-    while True:
-        async with aiohttp.ClientSession() as session:
-            for key, item in list(accounts.items()):
-                if item["notified"]:
-                    continue
+        await send_message(session, chat_id, "\n".join(lines))
+        return
 
-                username = item["username"]
-                url = f"https://www.instagram.com/{username}/"
+    if command == "/remove":
+        if len(parts) != 2:
+            await send_message(session, chat_id, "اكتب الأمر هكذا:\n/remove username")
+            return
 
-                try:
-                    async with session.get(
-                        url,
-                        timeout=15,
-                        headers={
-                            "User-Agent": "Mozilla/5.0"
-                        }
-                    ) as response:
-                        page = await response.text()
+        username = parts[1].lstrip("@").lower()
 
-                        # فحص أولي فقط، وليس إثباتاً للتنشيط
-                        active = (
-                            response.status == 200
-                            and f'"{username}"' in page.lower()
-                            and "sorry, this page isn't available" not in page.lower()
-                        )
+        if not re.fullmatch(r"[a-zA-Z0-9._]{1,30}", username):
+            await send_message(session, chat_id, "اسم المستخدم غير صالح.")
+            return
 
-                        if active:
-                            elapsed = int(time.time() - item["started"])
-                            h = elapsed // 3600
-                            m = (elapsed % 3600) // 60
-                            s = elapsed % 60
+        await request(
+            session, "DELETE",
+            f"{SUPABASE_API}/monitored_accounts",
+            params={
+                "username": f"eq.{username}",
+                "chat_id": f"eq.{chat_id}"
+            }
+        )
 
-                            await app.bot.send_message(
-                                chat_id=item["chat_id"],
-                                text=(
-                                    f"You can use @{username} again\n"
-                                    f"TAT: {h}h {m}m {s}s\n"
-                                    f"By: InstaReturn Bot"
-                                )
-                            )
+        await send_message(session, chat_id, f"تم حذف @{username} من قائمتك.")
+        return
 
-                            item["notified"] = True
-                            save_data()
+async def main():
+    async with aiohttp.ClientSession() as session:
+        offset = await get_offset(session)
 
-                except Exception:
-                    pass
+        result = await request(
+            session,
+            "GET",
+            f"{TELEGRAM_API}/getUpdates",
+            params={"offset": offset, "timeout": 0}
+        )
 
-        await asyncio.sleep(300)
+        if not result.get("ok"):
+            raise RuntimeError("Telegram API returned an error")
 
-async def post_init(app):
-    app.create_task(monitor(app))
+        updates = result.get("result", [])
 
-def main():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing")
+        for update in updates:
+            message = update.get("message")
+            if message:
+                await handle_message(session, message)
 
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+            offset = max(offset, update["update_id"] + 1)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add))
-    app.add_handler(CommandHandler("list", listing))
-    app.add_handler(CommandHandler("remove", remove))
-
-    app.run_polling()
+        if updates:
+            await save_offset(session, offset)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
